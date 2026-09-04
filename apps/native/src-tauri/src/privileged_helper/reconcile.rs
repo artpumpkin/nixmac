@@ -439,6 +439,13 @@ pub fn grant<E: Environment>(env: &E) -> Reconciled {
     decide(&RUNNING, env, HelperDecision::Granted)
 }
 
+/// Explicitly retry the existing standing decision. Unlike a routine
+/// observation this waits for the single-flight slot, but unlike [`grant`] it
+/// never changes an opt-in or opens System Settings.
+pub fn retry<E: Environment>(env: &E) -> Reconciled {
+    retry_with(&RUNNING, env)
+}
+
 /// The explicit Disable action: record the decision, then reconcile under it.
 /// The decision is written first, so a crash halfway resumes the removal
 /// rather than repairing the helper.
@@ -464,6 +471,11 @@ fn decide<E: Environment>(running: &Mutex<()>, env: &E, decision: HelperDecision
     }
     // Nothing this slot guards is half-applied by a panic — it guards no
     // data — so a poisoned lock is taken rather than propagated.
+    let _slot = running.lock().unwrap_or_else(PoisonError::into_inner);
+    reported(converge(env).unwrap_or_else(|report| report))
+}
+
+fn retry_with<E: Environment>(running: &Mutex<()>, env: &E) -> Reconciled {
     let _slot = running.lock().unwrap_or_else(PoisonError::into_inner);
     reported(converge(env).unwrap_or_else(|report| report))
 }
@@ -689,20 +701,24 @@ fn remove<E: Environment>(env: &E) -> Step {
 fn replace<E: Environment>(env: &E) -> Step {
     match env.replace_helper(&|| commit_to_register(env)) {
         Ok(()) => verify(env),
-        Err(failure) => Err(match failure {
+        Err(failure) => match failure {
             // The register step's own report, whatever it was: this pass
             // unregistered the old helper and deliberately registered
             // nothing in its place.
-            ReplaceFailure::RegisterDeclined(report) => report,
-            ReplaceFailure::UnregisterFailed(error) => unregister_failed(error),
-            ReplaceFailure::UnregisterSilent => unregister_failed("the unregister never reported"),
-            ReplaceFailure::RegisterFailed(error) => register_failed(error),
-            ReplaceFailure::RegisterSilent => register_failed("the register never reported"),
-            // Refused before anything was dispatched, so nothing changed.
-            ReplaceFailure::CalledOnMainThread => {
-                register_failed("a helper replacement cannot run on the main thread")
+            ReplaceFailure::RegisterDeclined(report) => Err(report),
+            ReplaceFailure::UnregisterFailed(error) => Err(unregister_failed(error)),
+            ReplaceFailure::UnregisterSilent => {
+                Err(unregister_failed("the unregister never reported"))
             }
-        }),
+            ReplaceFailure::RegisterFailed(error) => after_register_failure(env, error.to_string()),
+            ReplaceFailure::RegisterSilent => {
+                after_register_failure(env, "the register never reported".to_string())
+            }
+            // Refused before anything was dispatched, so nothing changed.
+            ReplaceFailure::CalledOnMainThread => Err(register_failed(
+                "a helper replacement cannot run on the main thread",
+            )),
+        },
     }
 }
 
@@ -710,14 +726,33 @@ fn register_fresh<E: Environment>(env: &E) -> Step {
     // The gates are inside the commitment, which is where every register's
     // immediately-before checks live.
     let committed = commit_to_register(env)?;
-    env.register(committed).map_err(|failure| match failure {
-        RegisterFailure::Failed(error) => register_failed(error),
-        RegisterFailure::Silent => register_failed("the register never reported"),
-        RegisterFailure::CalledOnMainThread => {
-            register_failed("a registration cannot run on the main thread")
+    match env.register(committed) {
+        Ok(()) => verify(env),
+        Err(RegisterFailure::Failed(error)) => after_register_failure(env, error.to_string()),
+        Err(RegisterFailure::Silent) => {
+            after_register_failure(env, "the register never reported".to_string())
         }
-    })?;
-    verify(env)
+        Err(RegisterFailure::CalledOnMainThread) => Err(register_failed(
+            "a registration cannot run on the main thread",
+        )),
+    }
+}
+
+/// A ServiceManagement register may report an error after macOS has already
+/// moved the service into a meaningful state. Judge that state once, without
+/// keying behavior to an unstable numeric error code or issuing a second
+/// register in this pass.
+fn after_register_failure<E: Environment>(env: &E, register_error: String) -> Step {
+    log::warn!("helper register reported an error: {register_error}");
+    match env.registration_status() {
+        Ok(RegistrationStatus::RequiresApproval) => Ok(Reconciled::PendingApproval),
+        Ok(RegistrationStatus::Enabled) => verify_listening(env),
+        Ok(RegistrationStatus::NotRegistered) => Err(register_failed(register_error)),
+        Ok(RegistrationStatus::NotFound) => Err(Reconciled::ServiceDefinitionBroken),
+        Err(status_error) => Err(register_failed(format!(
+            "{register_error}; the resulting registration status could not be read: {status_error}"
+        ))),
+    }
 }
 
 /// The register step's immediately-before checks, and the only mint of the
@@ -854,6 +889,7 @@ fn exchange_failed(error: HelperClientError) -> Reconciled {
 mod tests {
     use super::*;
     use crate::privileged_helper::peer_auth::ClientKind;
+    use crate::privileged_helper::service::ServiceCallError;
     use std::cell::RefCell;
     use std::path::PathBuf;
 
@@ -1092,6 +1128,14 @@ mod tests {
 
     fn this_build_idle() -> HelperReply {
         status_reply(THIS_BUILD, HelperStateName::Idle, None)
+    }
+
+    fn register_refusal() -> ServiceCallError {
+        ServiceCallError {
+            domain: "SMAppServiceErrorDomain".to_string(),
+            code: 1,
+            localized: "operation not permitted".to_string(),
+        }
     }
 
     /// The sentence a stopped report carries, or a failure naming what came
@@ -1410,6 +1454,139 @@ mod tests {
     // ── refusals and failures that end a pass ──────────────────────────────
 
     #[test]
+    fn a_fresh_register_error_is_judged_from_one_authoritative_status_read() {
+        for (resulting_status, expected) in [
+            (
+                Ok(RegistrationStatus::RequiresApproval),
+                Reconciled::PendingApproval,
+            ),
+            (
+                Ok(RegistrationStatus::NotFound),
+                Reconciled::ServiceDefinitionBroken,
+            ),
+        ] {
+            let world = World {
+                status: RefCell::new(vec![
+                    Ok(RegistrationStatus::NotRegistered),
+                    resulting_status,
+                ]),
+                register: RefCell::new(Some(RegisterFailure::Failed(register_refusal()))),
+                ..World::default()
+            };
+
+            assert_eq!(fresh_run(&world), expected);
+            assert_eq!(world.acts(), vec![Act::Registered]);
+        }
+
+        let world = World {
+            status: RefCell::new(vec![
+                Ok(RegistrationStatus::NotRegistered),
+                Ok(RegistrationStatus::Enabled),
+            ]),
+            register: RefCell::new(Some(RegisterFailure::Failed(register_refusal()))),
+            exchanges: RefCell::new(vec![Peer::Answered(this_build_idle())]),
+            ..World::default()
+        };
+        assert_eq!(fresh_run(&world), Reconciled::AtThisBuild);
+        assert_eq!(world.acts(), vec![Act::Registered]);
+    }
+
+    #[test]
+    fn a_fresh_register_error_keeps_its_diagnostics_when_nothing_registered() {
+        for resulting_status in [
+            Ok(RegistrationStatus::NotRegistered),
+            Err("status unavailable".to_string()),
+        ] {
+            let status_was_unavailable = resulting_status.is_err();
+            let world = World {
+                status: RefCell::new(vec![
+                    Ok(RegistrationStatus::NotRegistered),
+                    resulting_status,
+                ]),
+                register: RefCell::new(Some(RegisterFailure::Failed(register_refusal()))),
+                ..World::default()
+            };
+
+            let detail = stopped_text(&fresh_run(&world));
+            assert!(detail.contains("SMAppServiceErrorDomain 1"));
+            if status_was_unavailable {
+                assert!(detail.contains("status unavailable"));
+                assert!(detail.contains("resulting registration status could not be read"));
+            }
+            assert_eq!(world.acts(), vec![Act::Registered]);
+        }
+    }
+
+    #[test]
+    fn a_silent_fresh_register_uses_the_same_status_judgment() {
+        let world = World {
+            status: RefCell::new(vec![
+                Ok(RegistrationStatus::NotRegistered),
+                Ok(RegistrationStatus::RequiresApproval),
+            ]),
+            register: RefCell::new(Some(RegisterFailure::Silent)),
+            ..World::default()
+        };
+
+        assert_eq!(fresh_run(&world), Reconciled::PendingApproval);
+        assert_eq!(world.acts(), vec![Act::Registered]);
+    }
+
+    #[test]
+    fn first_time_grant_surfaces_approval_even_when_register_reports_an_error() {
+        let world = World {
+            status: RefCell::new(vec![
+                Ok(RegistrationStatus::NotRegistered),
+                Ok(RegistrationStatus::RequiresApproval),
+            ]),
+            preference: RefCell::new(Ok(HelperPreference::Unset)),
+            register: RefCell::new(Some(RegisterFailure::Failed(register_refusal()))),
+            ..World::default()
+        };
+
+        assert_eq!(
+            decide(&Mutex::new(()), &world, HelperDecision::Granted),
+            Reconciled::PendingApproval
+        );
+        assert_eq!(world.acts(), vec![Act::StoredGranted, Act::Registered]);
+    }
+
+    #[test]
+    fn a_replacement_register_error_uses_the_same_status_judgment() {
+        let world = World {
+            status: RefCell::new(vec![
+                Ok(RegistrationStatus::Enabled),
+                Ok(RegistrationStatus::RequiresApproval),
+            ]),
+            exchanges: RefCell::new(vec![Peer::Answered(status_reply(
+                OTHER_BUILD,
+                HelperStateName::Idle,
+                None,
+            ))]),
+            replace: RefCell::new(Some(ReplaceFailure::RegisterFailed(register_refusal()))),
+            ..World::default()
+        };
+
+        assert_eq!(fresh_run(&world), Reconciled::PendingApproval);
+        assert_eq!(world.acts(), vec![Act::Replaced]);
+
+        let world = World {
+            status: RefCell::new(vec![
+                Ok(RegistrationStatus::Enabled),
+                Ok(RegistrationStatus::Enabled),
+            ]),
+            exchanges: RefCell::new(vec![
+                Peer::Answered(status_reply(OTHER_BUILD, HelperStateName::Idle, None)),
+                Peer::Answered(this_build_idle()),
+            ]),
+            replace: RefCell::new(Some(ReplaceFailure::RegisterSilent)),
+            ..World::default()
+        };
+        assert_eq!(fresh_run(&world), Reconciled::AtThisBuild);
+        assert_eq!(world.acts(), vec![Act::Replaced]);
+    }
+
+    #[test]
     fn a_reply_that_is_not_a_status_is_a_refusal() {
         let world = World::answering(HelperReply::RequestNotUnderstood);
 
@@ -1633,6 +1810,59 @@ mod tests {
             // the registration it was stored for.
             assert_eq!(report, Reconciled::AtThisBuild);
             assert_eq!(acts, vec![Act::StoredGranted, Act::Registered]);
+        });
+    }
+
+    #[test]
+    fn retry_never_installs_for_an_undecided_or_disabled_user() {
+        for preference in [HelperPreference::Unset, HelperPreference::Disabled] {
+            let world = World {
+                preference: RefCell::new(Ok(preference)),
+                status: RefCell::new(vec![Ok(RegistrationStatus::NotRegistered)]),
+                ..World::default()
+            };
+            assert_eq!(retry_with(&Mutex::new(()), &world), Reconciled::NoHelper);
+            assert!(world.acts().is_empty());
+            assert_eq!(world.preference(), Ok(preference));
+        }
+    }
+
+    #[test]
+    fn retry_carries_out_a_stored_disable_without_rewriting_it() {
+        let world = World {
+            preference: RefCell::new(Ok(HelperPreference::Disabled)),
+            status: RefCell::new(vec![Ok(RegistrationStatus::RequiresApproval)]),
+            ..World::default()
+        };
+        assert_eq!(retry_with(&Mutex::new(()), &world), Reconciled::Removed);
+        assert_eq!(world.acts(), vec![Act::Unregistered]);
+        assert_eq!(world.preference(), Ok(HelperPreference::Disabled));
+    }
+
+    #[test]
+    fn retry_waits_for_a_real_pass_without_rewriting_the_decision() {
+        let running = Mutex::new(());
+        let held = running.lock().expect("a fresh lock");
+        std::thread::scope(|scope| {
+            let retried = scope.spawn(|| {
+                let world = World {
+                    status: RefCell::new(vec![
+                        Ok(RegistrationStatus::NotRegistered),
+                        Ok(RegistrationStatus::Enabled),
+                    ]),
+                    exchanges: RefCell::new(vec![Peer::Answered(this_build_idle())]),
+                    ..World::default()
+                };
+                let report = retry_with(&running, &world);
+                (report, world.acts())
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!retried.is_finished(), "retry did not wait for the slot");
+            drop(held);
+
+            let (report, acts) = retried.join().expect("retry");
+            assert_eq!(report, Reconciled::AtThisBuild);
+            assert_eq!(acts, vec![Act::Registered]);
         });
     }
 }
