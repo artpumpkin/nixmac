@@ -7,15 +7,9 @@ import { useEffect } from "react";
 import { DriftReviewActions } from "./drift-review-actions";
 import { DriftReview } from "./drift-review";
 
-// Mock Tauri API for Storybook (buildCheck etc. resolve to a no-op).
-if (typeof window !== "undefined") {
-  (window as any).__TAURI_INTERNALS__ = {
-    invoke: async (cmd: string) => {
-      console.log("Mock Tauri invoke:", cmd);
-      return null;
-    },
-  };
-}
+// Storybook never touches `window.__TAURI_INTERNALS__`: `@tauri-apps/api/core`
+// is aliased to `.storybook/mocks/tauri-core.ts`, and oRPC procedures are
+// mocked by path in `.storybook/mocks/tauri-runtime.ts`.
 
 const meta = preview.meta({
   title: "Widget/Drift/DriftReview",

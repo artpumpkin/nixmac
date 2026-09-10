@@ -284,6 +284,10 @@ export const orpcHandlers: Record<string, OrpcHandler> = {
     const { viewModelActions } = await import("@nixmac/state");
     return viewModelActions.getState().rebuildStatus ?? baseRebuildStatus();
   },
+  // Dry-run build check for manual drift: reports a passing result so
+  // stories show the ready "Build & Test" state instead of an unmocked-path
+  // 404 surfacing as a false "Build check failed" (DriftReviewActions).
+  "darwin.buildCheck": async () => ({ passed: true, output: "" }),
   "permissions.get": async () => {
     const { viewModelActions } = await import("@nixmac/state");
     return viewModelActions.getState().permissions ?? basePermissionsState();
