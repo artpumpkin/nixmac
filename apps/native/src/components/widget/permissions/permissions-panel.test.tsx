@@ -325,6 +325,55 @@ describe("PermissionsPanel — the unattended sync helper row", () => {
     expect(mockDisableHelper).not.toHaveBeenCalled();
   });
 
+  it.each(["before", "after"] as const)(
+    "drops approval instructions when the helper becomes ready %s the grant response",
+    async (readyWhen) => {
+      permissionsState.mockReturnValue(
+        helperRow("pending", "The unattended sync helper is not installed."),
+      );
+      let finishGrant: () => void = () => {};
+      mockRequest.mockReturnValue(
+        new Promise((resolve) => {
+          finishGrant = () => resolve(awaitingApprovalRow().permissions[0]);
+        }),
+      );
+
+      const { repaint } = await panel();
+      fireEvent.click(screen.getByRole("button", { name: "Enable" }));
+      helperPreference.mockReturnValue("granted");
+      permissionsState.mockReturnValue(awaitingApprovalRow());
+      repaint();
+
+      if (readyWhen === "after") {
+        finishGrant();
+        await waitFor(() => expect(mockRefresh).toHaveBeenCalledTimes(2));
+        expect(screen.getAllByText(APPROVE_IN_LOGIN_ITEMS)).toHaveLength(1);
+      }
+
+      const ready = "The unattended sync helper is installed and answering.";
+      permissionsState.mockReturnValue({
+        permissions: [
+          helperPermission({ status: "granted", helperPhase: "ready", instructions: ready }),
+        ],
+        allRequiredGranted: true,
+        checkedAt: null,
+      });
+      repaint();
+
+      if (readyWhen === "before") {
+        finishGrant();
+        await waitFor(() => expect(mockRefresh).toHaveBeenCalledTimes(2));
+      }
+
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: "Disable" })).toBeEnabled(),
+      );
+      expect(screen.getByText(ready)).toBeTruthy();
+      expect(screen.queryByText(APPROVE_IN_LOGIN_ITEMS)).toBeNull();
+      expect(screen.queryByRole("button", { name: /Open Settings/ })).toBeNull();
+    },
+  );
+
   it("offers Disable on a granted row whose decision was never recorded", async () => {
     // An adopted registration: the reconciliation run records `granted` before
     // it reports, so this is the window before the mirrored preference catches
@@ -444,21 +493,75 @@ describe("PermissionsPanel — the unattended sync helper row", () => {
     expect(running).toBeDisabled();
   });
 
-  it("disabling reports what the run did and re-probes", async () => {
+  it("uses the live row after disabling, without retaining a stale RPC report", async () => {
     permissionsState.mockReturnValue(helperRow("granted", "installed and answering"));
     mockDisableHelper.mockResolvedValue({
       atThisBuild: false,
-      phase: "disabled",
-      detail: "The unattended sync helper is disabled and has been removed.",
+      phase: "waitingForActivation",
+      detail: "nixmac is waiting for a running activation to finish before updating the unattended sync helper.",
     });
 
-    const { getByRole } = await panel();
+    const { getByRole, repaint } = await panel();
     fireEvent.click(getByRole("button", { name: "Disable" }));
 
     await waitFor(() => {
       expect(mockDisableHelper).toHaveBeenCalledTimes(1);
-      expect(mockRefresh).toHaveBeenCalled();
+      expect(mockRefresh).toHaveBeenCalledTimes(2);
     });
-    expect(screen.getByText("The unattended sync helper is disabled and has been removed.")).toBeTruthy();
+    const removed = "The unattended sync helper is disabled and has been removed.";
+    helperPreference.mockReturnValue("disabled");
+    permissionsState.mockReturnValue({
+      permissions: [helperPermission({ helperPhase: "disabled", instructions: removed })],
+      allRequiredGranted: false,
+      checkedAt: null,
+    });
+    repaint();
+
+    expect(screen.getAllByText(removed)).toHaveLength(1);
+    expect(screen.queryByText(/waiting for a running activation/)).toBeNull();
+    expect(screen.getByRole("button", { name: "Enable" })).toBeEnabled();
+  });
+
+  it.each(["Enable", "Retry", "Disable"] as const)(
+    "preserves a thrown %s error as a notice",
+    async (action) => {
+      helperPreference.mockReturnValue(action === "Enable" ? "unset" : "granted");
+      permissionsState.mockReturnValue({
+        permissions: [helperPermission({ helperPhase: "failed" })],
+        allRequiredGranted: false,
+        checkedAt: null,
+      });
+      const request = {
+        Enable: mockRequest,
+        Retry: mockRetryHelper,
+        Disable: mockDisableHelper,
+      }[action];
+      request.mockRejectedValue(new Error("helper action transport failed"));
+
+      await panel();
+      fireEvent.click(screen.getByRole("button", { name: action }));
+
+      await waitFor(() => expect(screen.getByText(/helper action transport failed/)).toBeTruthy());
+    },
+  );
+
+  it("preserves App Management guidance when the helper row changes", async () => {
+    const appManagement = {
+      ...adminRow,
+      id: "app-management",
+      name: "App Management",
+      instructions: "Allow nixmac to update managed apps.",
+    };
+    permissionsState.mockReturnValue(helperRow("pending", "a report", appManagement));
+    mockRequest.mockResolvedValue({});
+
+    const { repaint } = await panel();
+    fireEvent.click(screen.getByRole("button", { name: /Open Settings/ }));
+    await waitFor(() => expect(screen.getByText(/nixmac opened System Settings/)).toBeTruthy());
+
+    permissionsState.mockReturnValue(helperRow("granted", "installed and answering", appManagement));
+    repaint();
+    expect(screen.getByText(/nixmac opened System Settings/)).toBeTruthy();
+    await waitFor(() => expect(mockRefresh).toHaveBeenCalledTimes(2), { timeout: 2000 });
   });
 });

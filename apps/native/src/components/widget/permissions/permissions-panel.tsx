@@ -145,21 +145,9 @@ export function PermissionsPanel() {
             "nixmac opened System Settings → Privacy & Security → App Management. Enable nixmac there, then return here. macOS does not let nixmac verify this permission, so this recommended row may remain pending.",
         });
         await new Promise((resolve) => setTimeout(resolve, 1000));
-      } else if (permission.id === HELPER_PERMISSION_ID) {
-        // The backend records the decision and reconciles; it may open Login
-        // Items when approval is pending. Show this run's report only when it
-        // differs from the row's sentence — otherwise every click while
-        // approval is pending prints the same sentence twice.
-        const result = await tauriAPI.permissions.request(permission.id);
-        if (result.status !== "granted" && result.instructions !== permission.instructions) {
-          setNotice({
-            tone: "info",
-            message:
-              result.instructions ??
-              "nixmac could not finish enabling the unattended sync helper.",
-          });
-        }
       } else {
+        // Helper instructions come from the live permission row. Copying a
+        // request's result into a notice can outlive approval or recovery.
         // deprecated(orpc): replace with client/orpc from @/lib/orpc
         await tauriAPI.permissions.request(permission.id);
       }
@@ -185,8 +173,7 @@ export function PermissionsPanel() {
     startAction(HELPER_PERMISSION_ID, "disable");
     setNotice(null);
     try {
-      const report = await client.darwin.helperDisable();
-      setNotice({ tone: "info", message: report.detail });
+      await client.darwin.helperDisable();
       await client.permissions.refresh();
     } catch (error) {
       console.error("Failed to disable the unattended sync helper:", error);
