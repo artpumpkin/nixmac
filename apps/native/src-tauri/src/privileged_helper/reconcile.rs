@@ -37,7 +37,7 @@ use crate::privileged_helper::client::{
 };
 use crate::privileged_helper::protocol::{self, ActivationInfo, HelperReply, HelperStateName};
 use crate::privileged_helper::service::{
-    self, RegisterFailure, RegistrationStatus, ReplaceFailure,
+    self, RegisterFailure, RegistrationStatus, ReplaceFailure, ServiceDefinitionError,
 };
 use crate::shared_types::{HelperDecision, HelperPreference};
 use crate::state::preferences;
@@ -118,7 +118,7 @@ pub enum Reconciled {
     /// was unregistered, registered, or written, and no later run changes the
     /// answer: the user has to move the app or restart it.
     Displaced(String),
-    /// Final: `notFound` — the bundle's own service definition is broken, so
+    /// Final: the bundle's own service definition is missing or invalid, so
     /// there is nothing to register and nothing to remove. A property of the
     /// bundle, read identically every time.
     ServiceDefinitionBroken,
@@ -256,6 +256,10 @@ pub trait Environment {
     /// What `SMAppService` reports about nixmac's helper registration.
     fn registration_status(&self) -> Result<RegistrationStatus, String>;
 
+    /// Inspect the bundled plist and executable independently of the framework
+    /// record, which may not exist before the first registration.
+    fn check_service_definition(&self) -> Result<(), ServiceDefinitionError>;
+
     /// The stored decision about the helper.
     fn preference(&self) -> Result<HelperPreference, String>;
 
@@ -311,6 +315,15 @@ impl<R: Runtime> Environment for LiveEnvironment<'_, R> {
 
     fn registration_status(&self) -> Result<RegistrationStatus, String> {
         service::registration_status().map_err(|error| format!("{error:#}"))
+    }
+
+    fn check_service_definition(&self) -> Result<(), ServiceDefinitionError> {
+        match install_location::locate_app_bundle() {
+            InstallLocation::Canonical(bundle) => service::check_service_definition(&bundle),
+            InstallLocation::Elsewhere(_) => Err(ServiceDefinitionError::Unavailable(
+                "the installed app bundle could not be located".to_string(),
+            )),
+        }
     }
 
     fn preference(&self) -> Result<HelperPreference, String> {
@@ -509,10 +522,19 @@ enum Goal {
 fn converge<E: Environment>(env: &E) -> Step {
     env.gate()?;
     let status = status(env)?;
+    if status == RegistrationStatus::NotFound {
+        // On a first install BTM can read a valid daemon plist but have no
+        // record for it yet. Validate the package before deciding from opt-in.
+        check_definition(env)?;
+    }
     let goal = goal(env, status)?;
     match (status, goal) {
-        (RegistrationStatus::NotRegistered, Goal::Install) => register_fresh(env),
-        (RegistrationStatus::NotRegistered, Goal::Remove) => Ok(Reconciled::NoHelper),
+        (RegistrationStatus::NotRegistered | RegistrationStatus::NotFound, Goal::Install) => {
+            register_fresh(env)
+        }
+        (RegistrationStatus::NotRegistered | RegistrationStatus::NotFound, Goal::Remove) => {
+            Ok(Reconciled::NoHelper)
+        }
         // Approval is a state, not an error: reported, never re-registered,
         // and never a reason to open System Settings. This arm registers
         // nothing, however often it is reached.
@@ -521,10 +543,31 @@ fn converge<E: Environment>(env: &E) -> Step {
         // to observe before removing it.
         (RegistrationStatus::RequiresApproval, Goal::Remove) => remove(env),
         (RegistrationStatus::Enabled, goal) => classify(env, goal),
-        // Nothing to register and nothing to remove: the definition this
-        // would act on is not there.
-        (RegistrationStatus::NotFound, _) => Err(Reconciled::ServiceDefinitionBroken),
     }
+}
+
+fn check_definition<E: Environment>(env: &E) -> Result<(), Reconciled> {
+    env.check_service_definition().map_err(|error| match error {
+        ServiceDefinitionError::Invalid(detail) => {
+            log::warn!("invalid bundled helper definition: {detail}");
+            Reconciled::ServiceDefinitionBroken
+        }
+        ServiceDefinitionError::Unavailable(detail) => Reconciled::Stopped(format!(
+            "the bundled helper definition could not be checked: {detail}"
+        )),
+    })
+}
+
+/// Missing framework state after a register is a failed attempt, not proof
+/// that a valid local package is broken. A later explicit/bounded retry can
+/// try again, and readiness still requires the authenticated socket exchange.
+fn missing_registered_service<E: Environment>(env: &E, register_error: Option<&str>) -> Step {
+    check_definition(env)?;
+    let missing = "ServiceManagement has no helper record after registration";
+    Err(Reconciled::Stopped(match register_error {
+        Some(error) => format!("{error}; {missing}"),
+        None => missing.to_string(),
+    }))
 }
 
 fn status<E: Environment>(env: &E) -> Result<RegistrationStatus, Reconciled> {
@@ -558,9 +601,9 @@ fn goal<E: Environment>(env: &E, status: RegistrationStatus) -> Result<Goal, Rec
             }
             // Nothing to adopt. A first registration needs the explicit
             // Grant action, never an automatic path.
-            RegistrationStatus::NotRegistered => Err(Reconciled::NoHelper),
-            // Never resolves the decision; reported as the failure it is.
-            RegistrationStatus::NotFound => Err(Reconciled::ServiceDefinitionBroken),
+            RegistrationStatus::NotRegistered | RegistrationStatus::NotFound => {
+                Err(Reconciled::NoHelper)
+            }
         },
     }
 }
@@ -748,7 +791,7 @@ fn after_register_failure<E: Environment>(env: &E, register_error: String) -> St
         Ok(RegistrationStatus::RequiresApproval) => Ok(Reconciled::PendingApproval),
         Ok(RegistrationStatus::Enabled) => verify_listening(env),
         Ok(RegistrationStatus::NotRegistered) => Err(register_failed(register_error)),
-        Ok(RegistrationStatus::NotFound) => Err(Reconciled::ServiceDefinitionBroken),
+        Ok(RegistrationStatus::NotFound) => missing_registered_service(env, Some(&register_error)),
         Err(status_error) => Err(register_failed(format!(
             "{register_error}; the resulting registration status could not be read: {status_error}"
         ))),
@@ -772,6 +815,7 @@ fn after_register_failure<E: Environment>(env: &E, register_error: String) -> St
 fn commit_to_register<E: Environment>(env: &E) -> Result<Committed, Reconciled> {
     // A register is a mutation like any other.
     env.gate()?;
+    check_definition(env)?;
     match env.preference() {
         Ok(HelperPreference::Granted) => Ok(evidence::Committed::checked()),
         Ok(HelperPreference::Disabled | HelperPreference::Unset) => Err(Reconciled::Stopped(
@@ -785,25 +829,26 @@ fn commit_to_register<E: Environment>(env: &E) -> Result<Committed, Reconciled> 
 fn verify<E: Environment>(env: &E) -> Step {
     match status(env)? {
         RegistrationStatus::Enabled => verify_listening(env),
-        settled => verify_from_status(settled),
+        settled => verify_from_status(env, settled),
     }
 }
 
-/// Judges a dispatched registration from a status read alone.
+/// Judges a dispatched registration from fresh framework state. A missing
+/// record also checks the local definition before claiming the bundle is broken.
 ///
 /// Both status reads a verification can make land here: the one above, whose
 /// `enabled` goes to the listen window rather than to a verdict, and the fresh
 /// one taken when that window expires. So the `enabled` arm belongs to the
 /// second read alone — nothing answered, and the registration still says
 /// something should have.
-fn verify_from_status(status: RegistrationStatus) -> Step {
+fn verify_from_status<E: Environment>(env: &E, status: RegistrationStatus) -> Step {
     match status {
         // Registered, and macOS wants the user's approval. Normal.
         RegistrationStatus::RequiresApproval => Ok(Reconciled::PendingApproval),
         RegistrationStatus::NotRegistered => Err(Reconciled::Stopped(
             "the helper registration disappeared while it was being verified".to_string(),
         )),
-        RegistrationStatus::NotFound => Err(Reconciled::ServiceDefinitionBroken),
+        RegistrationStatus::NotFound => missing_registered_service(env, None),
         RegistrationStatus::Enabled => Err(Reconciled::Stopped(
             "the registered helper never answered on its socket".to_string(),
         )),
@@ -840,7 +885,7 @@ fn verify_listening<E: Environment>(env: &E) -> Step {
     // never answered — a failure — for a state that is not one. The window
     // is the only thing between the two reads, and it is long enough for
     // macOS to have changed its answer inside it.
-    verify_from_status(status(env)?)
+    verify_from_status(env, status(env)?)
 }
 
 fn judge<E: Environment>(env: &E, reply: HelperReply) -> Step {
@@ -973,6 +1018,7 @@ mod tests {
         /// *which* gate a refusal stopped.
         gates: RefCell<Vec<Result<(), Reconciled>>>,
         status: RefCell<Vec<Result<RegistrationStatus, String>>>,
+        definition: RefCell<Vec<Result<(), ServiceDefinitionError>>>,
         preference: RefCell<Result<HelperPreference, String>>,
         exchanges: RefCell<Vec<Peer>>,
         listener: ListenerObservation,
@@ -991,6 +1037,7 @@ mod tests {
                 compiled: THIS_BUILD,
                 gates: RefCell::new(vec![Ok(())]),
                 status: RefCell::new(vec![Ok(RegistrationStatus::Enabled)]),
+                definition: RefCell::new(vec![Ok(())]),
                 preference: RefCell::new(Ok(HelperPreference::Granted)),
                 exchanges: RefCell::new(Vec::new()),
                 listener: ListenerObservation::PositivelyAbsent,
@@ -1057,6 +1104,15 @@ mod tests {
                 statuses.remove(0)
             } else {
                 statuses[0].clone()
+            }
+        }
+
+        fn check_service_definition(&self) -> Result<(), ServiceDefinitionError> {
+            let mut definitions = self.definition.borrow_mut();
+            if definitions.len() > 1 {
+                definitions.remove(0)
+            } else {
+                definitions[0].clone()
             }
         }
 
@@ -1445,10 +1501,109 @@ mod tests {
     fn a_broken_service_definition_stops_the_pass() {
         let world = World {
             status: RefCell::new(vec![Ok(RegistrationStatus::NotFound)]),
+            definition: RefCell::new(vec![Err(ServiceDefinitionError::Invalid(
+                "missing helper plist".to_string(),
+            ))]),
             ..World::default()
         };
 
         assert_eq!(fresh_run(&world), Reconciled::ServiceDefinitionBroken);
+        assert!(world.acts().is_empty());
+    }
+
+    #[test]
+    fn a_valid_never_registered_helper_registers_only_when_granted_and_verifies() {
+        let world = World::default()
+            .with_statuses(vec![
+                Ok(RegistrationStatus::NotFound),
+                Ok(RegistrationStatus::Enabled),
+            ])
+            .with_exchanges(vec![Peer::Answered(this_build_idle())]);
+
+        assert_eq!(fresh_run(&world), Reconciled::AtThisBuild);
+        assert_eq!(world.acts(), vec![Act::Registered]);
+    }
+
+    #[test]
+    fn a_valid_never_registered_helper_does_not_adopt_or_override_a_missing_opt_in() {
+        for preference in [HelperPreference::Unset, HelperPreference::Disabled] {
+            let world = World {
+                preference: RefCell::new(Ok(preference)),
+                status: RefCell::new(vec![Ok(RegistrationStatus::NotFound)]),
+                ..World::default()
+            };
+
+            assert_eq!(fresh_run(&world), Reconciled::NoHelper);
+            assert!(world.acts().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_definition_that_becomes_invalid_before_registration_cannot_register() {
+        let world = World {
+            status: RefCell::new(vec![Ok(RegistrationStatus::NotFound)]),
+            definition: RefCell::new(vec![
+                Ok(()),
+                Err(ServiceDefinitionError::Invalid(
+                    "helper executable disappeared".to_string(),
+                )),
+            ]),
+            ..World::default()
+        };
+
+        assert_eq!(fresh_run(&world), Reconciled::ServiceDefinitionBroken);
+        assert!(world.acts().is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_definition_is_a_retryable_failure_and_authorizes_nothing() {
+        let world = World {
+            status: RefCell::new(vec![Ok(RegistrationStatus::NotFound)]),
+            definition: RefCell::new(vec![Err(ServiceDefinitionError::Unavailable(
+                "permission denied reading helper plist".to_string(),
+            ))]),
+            ..World::default()
+        };
+
+        assert!(stopped_text(&fresh_run(&world)).contains("could not be checked"));
+        assert!(world.acts().is_empty());
+    }
+
+    #[test]
+    fn a_missing_framework_record_after_register_is_not_readiness_or_a_broken_bundle() {
+        let world = World::default().with_statuses(vec![Ok(RegistrationStatus::NotFound)]);
+
+        assert_eq!(
+            fresh_run(&world),
+            Reconciled::Stopped(
+                "ServiceManagement has no helper record after registration".to_string()
+            )
+        );
+        assert_eq!(
+            world.acts(),
+            vec![Act::Registered],
+            "only one attempt in the pass"
+        );
+    }
+
+    #[test]
+    fn a_failed_first_registration_can_retry_and_reach_authenticated_readiness() {
+        let world = World {
+            status: RefCell::new(vec![
+                Ok(RegistrationStatus::NotFound),
+                Ok(RegistrationStatus::NotFound),
+                Ok(RegistrationStatus::NotFound),
+                Ok(RegistrationStatus::Enabled),
+            ]),
+            register: RefCell::new(Some(RegisterFailure::Failed(register_refusal()))),
+            exchanges: RefCell::new(vec![Peer::Answered(this_build_idle())]),
+            ..World::default()
+        };
+
+        assert!(matches!(fresh_run(&world), Reconciled::Stopped(_)));
+        assert_eq!(world.acts(), vec![Act::Registered]);
+        assert_eq!(fresh_run(&world), Reconciled::AtThisBuild);
+        assert_eq!(world.acts(), vec![Act::Registered, Act::Registered]);
     }
 
     // ── refusals and failures that end a pass ──────────────────────────────
@@ -1462,7 +1617,10 @@ mod tests {
             ),
             (
                 Ok(RegistrationStatus::NotFound),
-                Reconciled::ServiceDefinitionBroken,
+                Reconciled::Stopped(format!(
+                    "{}; ServiceManagement has no helper record after registration",
+                    register_refusal()
+                )),
             ),
         ] {
             let world = World {
