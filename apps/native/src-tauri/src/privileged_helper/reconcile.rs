@@ -789,7 +789,12 @@ fn after_register_failure<E: Environment>(env: &E, register_error: String) -> St
     log::warn!("helper register reported an error: {register_error}");
     match env.registration_status() {
         Ok(RegistrationStatus::RequiresApproval) => Ok(Reconciled::PendingApproval),
-        Ok(RegistrationStatus::Enabled) => verify_listening(env),
+        Ok(RegistrationStatus::Enabled) => verify_listening(env).map_err(|report| match report {
+            Reconciled::Stopped(detail) => Reconciled::Stopped(format!(
+                "{register_error}; helper verification failed: {detail}"
+            )),
+            other => other,
+        }),
         Ok(RegistrationStatus::NotRegistered) => Err(register_failed(register_error)),
         Ok(RegistrationStatus::NotFound) => missing_registered_service(env, Some(&register_error)),
         Err(status_error) => Err(register_failed(format!(
@@ -1673,6 +1678,115 @@ mod tests {
             }
             assert_eq!(world.acts(), vec![Act::Registered]);
         }
+    }
+
+    #[test]
+    fn register_errors_survive_failed_verification_for_fresh_and_replacement_helpers() {
+        for (peers, verification_detail) in [
+            (
+                vec![Peer::RootUnverifiable],
+                "the helper socket is held by something unidentified: ad-hoc signature".to_string(),
+            ),
+            (
+                vec![Peer::Answered(status_reply(
+                    OTHER_BUILD,
+                    HelperStateName::Idle,
+                    None,
+                ))],
+                format!("the registered helper reports build {OTHER_BUILD}, not this build"),
+            ),
+            (
+                vec![Peer::Unreachable; VERIFY_LISTEN_ATTEMPTS as usize],
+                "the registered helper never answered on its socket".to_string(),
+            ),
+        ] {
+            for replacing in [false, true] {
+                let mut exchanges = Vec::new();
+                if replacing {
+                    exchanges.push(Peer::Answered(status_reply(
+                        OTHER_BUILD,
+                        HelperStateName::Idle,
+                        None,
+                    )));
+                }
+                exchanges.extend(peers.clone());
+                let world = World {
+                    status: RefCell::new(vec![
+                        Ok(if replacing {
+                            RegistrationStatus::Enabled
+                        } else {
+                            RegistrationStatus::NotRegistered
+                        }),
+                        Ok(RegistrationStatus::Enabled),
+                    ]),
+                    register: RefCell::new(
+                        (!replacing).then(|| RegisterFailure::Failed(register_refusal())),
+                    ),
+                    replace: RefCell::new(
+                        replacing.then(|| ReplaceFailure::RegisterFailed(register_refusal())),
+                    ),
+                    exchanges: RefCell::new(exchanges),
+                    ..World::default()
+                };
+
+                assert_eq!(
+                    stopped_text(&fresh_run(&world)),
+                    format!(
+                        "{}; helper verification failed: {verification_detail}",
+                        register_refusal()
+                    )
+                );
+                assert_eq!(
+                    world.acts(),
+                    vec![if replacing {
+                        Act::Replaced
+                    } else {
+                        Act::Registered
+                    }]
+                );
+                assert_eq!(*world.preference.borrow(), Ok(HelperPreference::Granted));
+            }
+        }
+    }
+
+    #[test]
+    fn register_error_does_not_change_approval_discovered_during_verification() {
+        let world = World {
+            status: RefCell::new(vec![
+                Ok(RegistrationStatus::NotRegistered),
+                Ok(RegistrationStatus::Enabled),
+                Ok(RegistrationStatus::RequiresApproval),
+            ]),
+            register: RefCell::new(Some(RegisterFailure::Failed(register_refusal()))),
+            exchanges: RefCell::new(vec![Peer::Unreachable; VERIFY_LISTEN_ATTEMPTS as usize]),
+            ..World::default()
+        };
+
+        assert_eq!(fresh_run(&world), Reconciled::PendingApproval);
+        assert_eq!(world.acts(), vec![Act::Registered]);
+    }
+
+    #[test]
+    fn register_error_does_not_reclassify_a_broken_definition_after_verification() {
+        let world = World {
+            status: RefCell::new(vec![
+                Ok(RegistrationStatus::NotRegistered),
+                Ok(RegistrationStatus::Enabled),
+                Ok(RegistrationStatus::NotFound),
+            ]),
+            definition: RefCell::new(vec![
+                Ok(()),
+                Err(ServiceDefinitionError::Invalid(
+                    "helper executable disappeared".to_string(),
+                )),
+            ]),
+            register: RefCell::new(Some(RegisterFailure::Failed(register_refusal()))),
+            exchanges: RefCell::new(vec![Peer::Unreachable; VERIFY_LISTEN_ATTEMPTS as usize]),
+            ..World::default()
+        };
+
+        assert_eq!(fresh_run(&world), Reconciled::ServiceDefinitionBroken);
+        assert_eq!(world.acts(), vec![Act::Registered]);
     }
 
     #[test]
