@@ -217,7 +217,7 @@ export function RepairBanners({
                     : issue.phase === "reconciling"
                       ? "Finishing unattended sync setup…"
                       : issue.phase === "waitingForActivation"
-                        ? "Waiting for the current sync to finish"
+                        ? "Waiting for the current build or restore to finish"
                         : issue.phase === "needsUserAction"
                           ? "Unattended sync needs your attention"
                           : "Couldn’t finish enabling unattended sync"}
