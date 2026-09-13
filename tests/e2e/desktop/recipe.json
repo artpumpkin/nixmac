@@ -1,0 +1,44 @@
+{
+  "id": "nixmac",
+  "build": { "kind": "dmg", "appBundle": "nixmac.app" },
+  "stateFiles": {
+    "preferences": "~/Library/Application Support/com.darkmatter.nixmac/global-preferences.json",
+    "onboarding": "~/Library/Application Support/com.darkmatter.nixmac/onboarding-state.json",
+    "evolve": "~/Library/Application Support/com.darkmatter.nixmac/evolve-state.json",
+    "build": "~/Library/Application Support/com.darkmatter.nixmac/build-state.json",
+    "legacy-settings": "~/Library/Application Support/com.darkmatter.nixmac/settings.json",
+    "query-cache": "~/Library/Application Support/com.darkmatter.nixmac/query-cache.json"
+  },
+  "scenarios": {
+    "launch": {
+      "description": "A verified release installs into /Applications and opens a native Nix Mac window.",
+      "steps": [
+        { "kind": "execute", "description": "Launch the installed application", "command": "/usr/bin/open", "args": ["-a", "{{app.path}}"] },
+        { "kind": "execute", "description": "Wait for a native application window", "command": "/usr/bin/osascript", "args": ["-e", "tell application \"System Events\"\nrepeat 60 times\nif exists process \"nixmac\" then\ntell process \"nixmac\"\nif (count of windows) > 0 then return \"nixmac window ready\"\nend tell\nend if\ndelay 1\nend repeat\nerror \"nixmac did not open a window\"\nend tell"], "timeoutMs": 90000, "stdoutIncludes": "nixmac window ready" },
+        { "kind": "observe", "description": "Wait for the rendered onboarding screen", "name": "nixmac-window", "app": "nixmac", "includes": "Config Directory", "timeoutMs": 30000 }
+      ]
+    },
+    "startup-recovery": {
+      "description": "Load the startup-recovery initial state, reconcile an interrupted onboarding completion, and show the missing-configuration repair view after hydration.",
+      "steps": [
+        { "kind": "execute", "description": "Verify the intended pre-launch recovery state", "command": "/usr/bin/osascript", "args": ["-l", "JavaScript", "-e", "ObjC.import('Foundation'); const stateDir = ObjC.unwrap($.NSHomeDirectory()) + '/Library/Application Support/com.darkmatter.nixmac/'; function readState(name) { return JSON.parse(ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError(stateDir + name, $.NSUTF8StringEncoding, null))); } const onboarding = readState('onboarding-state.json'); const preferences = readState('global-preferences.json'); if (onboarding.completedAt !== null || onboarding.lastBuildAt !== 1751967600 || preferences.configDir !== '/tmp/nixmac-desktop-missing-config') throw new Error('startup-recovery requires its initial-state fixture'); 'nixmac recovery seed verified';"], "stdoutIncludes": "nixmac recovery seed verified" },
+        { "kind": "execute", "description": "Require the seeded missing configuration to have no flake", "command": "/bin/test", "args": ["!", "-e", "/tmp/nixmac-desktop-missing-config/flake.nix"] },
+        { "kind": "execute", "description": "Launch Nix Mac with the seeded on-disk state", "command": "/usr/bin/open", "args": ["-a", "{{app.path}}"] },
+        { "kind": "observe", "description": "Wait for the hydrated repair view", "name": "startup-recovery-window", "app": "nixmac", "includes": "Configuration not found", "timeoutMs": 60000 },
+        { "kind": "observe", "description": "Verify the repair view identifies the supplied configuration path", "name": "startup-recovery-path", "app": "nixmac", "includes": "/tmp/nixmac-desktop-missing-config", "timeoutMs": 10000 },
+        { "kind": "execute", "description": "Verify Nix Mac persisted the recovered completion timestamp", "command": "/bin/sh", "args": ["-eu", "-c", "nixmac_state_dir=\"$HOME/Library/Application Support/com.darkmatter.nixmac\"\nnixmac_completed=$(/usr/bin/plutil -extract completedAt raw -o - \"$nixmac_state_dir/onboarding-state.json\")\n/bin/test \"$nixmac_completed\" = 1751967600\n/bin/cp \"$nixmac_state_dir/onboarding-state.json\" /tmp/nixmac-desktop-recovered-onboarding.json\n/bin/cp \"$nixmac_state_dir/global-preferences.json\" /tmp/nixmac-desktop-loaded-preferences.json\n/usr/bin/printf 'nixmac recovered completion: %s\\n' \"$nixmac_completed\""], "stdoutIncludes": "nixmac recovered completion: 1751967600" },
+        { "kind": "artifact", "description": "Retain the app-written recovery state", "guestPath": "/tmp/nixmac-desktop-recovered-onboarding.json", "name": "recovered-onboarding.json" },
+        { "kind": "artifact", "description": "Retain the loaded preferences for reproduction", "guestPath": "/tmp/nixmac-desktop-loaded-preferences.json", "name": "loaded-preferences.json" }
+      ]
+    },
+    "package-tools": {
+      "description": "Nix and Homebrew are usable from the prepared desktop, and Nix Mac opens alongside them.",
+      "steps": [
+        { "kind": "execute", "description": "Check Nix installation", "command": "/nix/var/nix/profiles/default/bin/nix", "args": ["--version"], "stdoutIncludes": "nix" },
+        { "kind": "execute", "description": "Check Homebrew installation", "command": "/opt/homebrew/bin/brew", "args": ["--version"], "stdoutIncludes": "Homebrew" },
+        { "kind": "execute", "description": "Launch Nix Mac", "command": "/usr/bin/open", "args": ["-a", "{{app.path}}"] },
+        { "kind": "observe", "description": "Inspect the rendered onboarding screen on the configured desktop", "name": "package-tools-window", "app": "nixmac", "includes": "Config Directory", "timeoutMs": 30000 }
+      ]
+    }
+  }
+}
