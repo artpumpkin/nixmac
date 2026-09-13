@@ -99,8 +99,10 @@ Startup migrations matter when composing a seed:
 There is **no persisted switch that starts an in-flight loading operation**.
 `packages/state/src/viewmodel/store.ts` begins with `hydrated: false`;
 `DarwinWidget` hydrates the backend slices and probes permissions, Nix and Git
-before showing the onboarding or main view. During that initial hydration it
-renders a neutral container. UI processing flags, Nix installation progress,
+before showing the onboarding or main view. During that initial hydration,
+release v0.33.1 renders a neutral container; current source renders a staged
+`SplashScreen`. Both depend on live probes rather than a persisted loading flag.
+UI processing flags, Nix installation progress,
 rebuild-running status, Git status and permissions are runtime state. Current
 source also keeps secrets-vault loading in memory. `lastEvolutionState` accepts
 the historical enum value `"loading"`, but setting it does not launch or resume
